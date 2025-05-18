@@ -28,13 +28,19 @@
 #include "service_loop.h"
 #include "utils/log.h"
 
-#define CONFIG_GATT_CLIENT_SERVICE_MAX 10
-#define CONFIG_GATT_CLIENT_ELEMENT_MAX 20
-
 #ifdef CONFIG_BLUETOOTH_GATT
 #define STACK_CALL(func) zblue_##func
 
+#define CONFIG_GATT_CLIENT_CHAR_PER_SERVICE_MAX 200
+
 typedef void (*sal_func_t)(void* args);
+
+typedef struct {
+    uint16_t decl_handle;
+    uint16_t value_handle;
+    uint8_t  properties;
+    bt_uuid_t uuid;
+} gatt_element_char_t;
 
 union uuid {
     struct bt_uuid uuid;
@@ -45,7 +51,8 @@ union uuid {
 struct gatt_service {
     uint16_t start_handle;
     uint16_t end_handle;
-    const struct bt_uuid* uuid;
+    bt_uuid_t uuid;
+    const struct bt_uuid* uuid_ref;
 };
 
 struct gatt_instance {
@@ -55,8 +62,12 @@ struct gatt_instance {
     uint8_t service_size;
     uint8_t element_idx;
     uint8_t element_size;
+    uint8_t element_char_idx;
+    uint8_t element_char_size;
+    uint8_t current_element_base_idx;
     struct gatt_service service[CONFIG_GATT_CLIENT_SERVICE_MAX];
     gatt_element_t element[CONFIG_GATT_CLIENT_ELEMENT_MAX];
+    gatt_element_char_t element_char[CONFIG_GATT_CLIENT_CHAR_PER_SERVICE_MAX];
 };
 
 typedef union {
@@ -74,7 +85,18 @@ typedef struct {
 static bt_status_t zblue_gatt_client_discover_chrc(struct bt_conn* conn, const struct bt_uuid* uuid,
     uint16_t start_handle, uint16_t end_handle);
 
+static bt_status_t zblue_gatt_client_discover_descriptor(struct bt_conn* conn, const struct bt_uuid* uuid,
+    uint16_t start_handle, uint16_t end_handle);
+
 static struct gatt_instance g_gatt_client[CONFIG_BLUETOOTH_GATTC_MAX_CONNECTIONS];
+
+static void zblue_conn_get_addr(struct bt_conn* conn, bt_address_t* addr)
+{
+    struct bt_conn_info info;
+
+    bt_conn_get_info(conn, &info);
+    bt_addr_set(addr, info.le.dst->a.val);
+}
 
 static struct gatt_instance* gatt_find_instance_by_addr(bt_address_t* addr)
 {
@@ -138,6 +160,7 @@ static struct gatt_service* gatt_alloc_service_by_addr(bt_address_t* addr)
 
     if (instance->service_size >= CONFIG_GATT_CLIENT_SERVICE_MAX) {
         BT_LOGE("%s, service_size:%d overflow", __func__, instance->service_size);
+        bt_sal_gatt_client_disconnect(PRIMARY_ADAPTER, addr);
         return NULL;
     }
 
@@ -156,6 +179,7 @@ static gatt_element_t* gatt_alloc_element_by_addr(bt_address_t* addr)
 
     if (instance->element_size >= CONFIG_GATT_CLIENT_ELEMENT_MAX) {
         BT_LOGE("%s, element_size:%d overflow", __func__, instance->element_size);
+        bt_sal_gatt_client_disconnect(PRIMARY_ADAPTER, addr);
         return NULL;
     }
 
@@ -204,7 +228,7 @@ static void STACK_CALL(conn_connect)(void* args)
 {
     sal_adapter_req_t* req = args;
     bt_addr_le_t address = { 0 };
-    struct bt_conn* conn;
+    struct bt_conn* conn = NULL;
     int err;
 
     address.type = req->addr_type;
@@ -261,7 +285,7 @@ bt_status_t bt_sal_gatt_client_connect(bt_controller_id_t id, bt_address_t* addr
 static void STACK_CALL(conn_disconnect)(void* args)
 {
     sal_adapter_req_t* req = args;
-    struct bt_conn* conn;
+    struct bt_conn* conn = NULL;
     int err;
 
     gatt_free_instance(&req->addr);
@@ -273,9 +297,9 @@ static void STACK_CALL(conn_disconnect)(void* args)
     }
 
     err = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+
     if (err) {
         BT_LOGE("%s, disconnect fail err:%d", __func__, err);
-        return;
     }
 }
 
@@ -321,16 +345,16 @@ static bool zblue_uuid1_to_uuid2(const struct bt_uuid* u1, bt_uuid_t* u2)
     return true;
 }
 
-static uint8_t zblue_gatt_client_disc_chrc_callback(struct bt_conn* conn, const struct bt_gatt_attr* attr,
+static uint8_t zblue_gatt_client_disc_desc_callback(struct bt_conn* conn, const struct bt_gatt_attr* attr,
     struct bt_gatt_discover_params* params)
 {
-    struct bt_gatt_chrc* data;
     struct gatt_instance* instance;
+    struct gatt_service* service;
     gatt_element_t* element;
     bt_address_t addr;
+    uint16_t start_HDL, end_HDL;
 
     get_le_addr_from_conn(conn, &addr);
-
     instance = gatt_find_instance_by_addr(&addr);
     if (!instance) {
         BT_LOGE("%s, instance null", __func__);
@@ -338,54 +362,195 @@ static uint8_t zblue_gatt_client_disc_chrc_callback(struct bt_conn* conn, const 
     }
 
     if (!attr) {
-        BT_LOGD("%s, uuid discovery chrc finish", __func__);
-        if (instance->service_idx < instance->service_size) {
-            struct gatt_service* service;
+        BT_LOGD("%s, descriptor discovery finished for service_idx:%d", __func__, instance->service_idx);
 
-            BT_LOGD("%s, service_idx:%d", __func__, instance->service_idx);
-            service = &instance->service[instance->service_idx++];
-            zblue_gatt_client_discover_chrc(conn, service->uuid, service->start_handle, service->end_handle);
-        } else {
-            BT_LOGD("%s, discover service finished", __func__);
-            if_gattc_on_service_discovered(&instance->addr, instance->element, instance->element_size);
-            if_gattc_on_discover_completed(&addr, GATT_STATUS_SUCCESS);
+        if (instance->element_char_idx == 0 && instance->element_char_size == 0) {
+
+            /* 通过条件判断是否是最后一轮所有char已经找完了 */
+            if (instance->service_idx < instance->service_size) {
+                /* 这个char已经找完了，看下个service了 */
+                uint8_t base = instance->current_element_base_idx;
+                uint8_t size = instance->element_size - base;
+
+                if_gattc_on_service_discovered(&instance->addr, &instance->element[base], size);
+
+                BT_LOGD("%s, before increment: service_idx = %d", __func__, instance->service_idx);
+                service = &instance->service[instance->service_idx];
+                /* 取新的service */
+                BT_LOGD("%s, after increment: service_idx = %d", __func__, instance->service_idx);
+                instance->current_element_base_idx = instance->element_size;
+
+                /* Save new service declaration */
+                element = gatt_alloc_element_by_addr(&addr);
+                if (element) {
+                    element->handle = service->start_handle;
+                    memcpy(&element->uuid, &service->uuid, sizeof(bt_uuid_t));
+                    element->type = BT_GATT_DISCOVER_PRIMARY;
+                    element->properties = 0;
+                    element->permissions = 0;
+                                    BT_LOGD("%s, element inserted: type=0x%02X, handle=0x%04X, idx = %u", __func__,
+                        element->type, element->handle, instance->element_size);
+                }
+                /* 重新查找char */
+                zblue_gatt_client_discover_chrc(conn, service->uuid_ref, service->start_handle, service->end_handle);
+            } else {
+                /* 所有service找完，上报completed */
+                BT_LOGD("%s, all services discovered", __func__);
+                uint8_t base = instance->current_element_base_idx;
+                uint8_t size = instance->element_size - base;
+
+                if_gattc_on_service_discovered(&instance->addr, &instance->element[base], size);
+                if_gattc_on_discover_completed(&addr, GATT_STATUS_SUCCESS);
+                instance->element_size = 0;
+                instance->service_idx = 0;
+                instance->service_size = 0;
+                instance->current_element_base_idx = 0;
+                instance->element_char_idx = 0;
+                instance->element_char_size = 0;
+            }
+            return BT_GATT_ITER_STOP;
+
         }
+        /* 上面的if条件是所有 char找完了，所以到这就是还有char */
+
+iter:
+        BT_LOGD("%s, before increment: service_idx = %d", __func__, instance->service_idx);
+        service = &instance->service[instance->service_idx];
+        /* 先存新char */
+        element = gatt_alloc_element_by_addr(&addr);
+        if (!element) {
+            BT_LOGE("%s, alloc element fail", __func__);
+            return BT_GATT_ITER_STOP;
+        }
+        element->type = BT_GATT_DISCOVER_CHARACTERISTIC;
+        element->handle = instance->element_char[instance->element_char_idx].value_handle;
+        element->properties = instance->element_char[instance->element_char_idx].properties;
+        memcpy(&element->uuid, &instance->element_char[instance->element_char_idx].uuid, sizeof(bt_uuid_t));
+                    BT_LOGD("%s, element inserted: type=0x%02X, handle=0x%04X, idx = %u", __func__,
+                        element->type, element->handle, instance->element_size);
+
+        start_HDL = instance->element_char[instance->element_char_idx++].value_handle + 1;
+
+        if (instance->element_char_idx < instance->element_char_size) {
+            end_HDL = instance->element_char[instance->element_char_idx].decl_handle - 1;
+        } else {
+            /* 这是当前service的最后一个char */
+            end_HDL = service->end_handle;
+            instance->element_char_idx = 0;
+            instance->element_char_size = 0;
+            instance->service_idx++;
+            BT_LOGE("last");
+            /* 先给char索引值复位 */
+            // zblue_gatt_client_discover_descriptor(conn, NULL, start_HDL, end_HDL);
+            // return BT_GATT_ITER_STOP;
+        }
+
+        if (start_HDL <= end_HDL) {
+            /* 有效handle，继续找descriptor */
+            zblue_gatt_client_discover_descriptor(conn, NULL, start_HDL, end_HDL);
+        } else if (instance->element_char_idx == 0 && instance->element_char_size == 0) {
+            /* 通过条件判断是否是最后一轮所有char已经找完了 */
+            if (instance->service_idx < instance->service_size) {
+                /* 这个char已经找完了，看下个service了 */
+                uint8_t base = instance->current_element_base_idx;
+                uint8_t size = instance->element_size - base;
+
+                if_gattc_on_service_discovered(&instance->addr, &instance->element[base], size);
+
+                BT_LOGD("%s, before increment: service_idx = %d", __func__, instance->service_idx);
+                service = &instance->service[instance->service_idx];
+                BT_LOGD("%s, after increment: service_idx = %d", __func__, instance->service_idx);
+                instance->current_element_base_idx = instance->element_size;
+
+                /* Save new service declaration */
+                element = gatt_alloc_element_by_addr(&addr);
+                if (element) {
+                    element->handle = service->start_handle;
+                    memcpy(&element->uuid, &service->uuid, sizeof(bt_uuid_t));
+                    element->type = BT_GATT_DISCOVER_PRIMARY;
+                    element->properties = 0;
+                    element->permissions = 0;
+                                        BT_LOGD("%s, element inserted: type=0x%02X, handle=0x%04X, idx = %u", __func__,
+                        element->type, element->handle, instance->element_size);
+                }
+                /* 重新查找char */
+                zblue_gatt_client_discover_chrc(conn, service->uuid_ref, service->start_handle, service->end_handle);
+            } else {
+                /* 所有service找完，上报completed */
+                BT_LOGD("%s, all services discovered", __func__);
+                uint8_t base = instance->current_element_base_idx;
+                uint8_t size = instance->element_size - base;
+
+                if_gattc_on_service_discovered(&instance->addr, &instance->element[base], size);
+                if_gattc_on_discover_completed(&addr, GATT_STATUS_SUCCESS);
+                instance->element_size = 0;
+                instance->service_idx = 0;
+                instance->service_size = 0;
+                instance->current_element_base_idx = 0;
+                instance->element_char_idx = 0;
+                instance->element_char_size = 0;
+            }
+            return BT_GATT_ITER_STOP;
+        } 
+        else {
+            BT_LOGE("start_HDL > end_HDL");
+            goto iter;
+            /* 无效handle， goto label重新找新char，先把新char存起来 */
+        }
+        // if (instance->service_idx < instance->service_size) {
+
+        //     uint8_t base = instance->current_element_base_idx;
+        //     uint8_t size = instance->element_size - base;
+
+        //     if_gattc_on_service_discovered(&instance->addr, &instance->element[base], size);
+
+        //     struct gatt_service* service = &instance->service[instance->service_idx++];
+        //     instance->current_element_base_idx = instance->element_size;
+
+        //     /* Save new service declaration */
+        //     element = gatt_alloc_element_by_addr(&addr);
+        //     if (element) {
+        //         element->handle = service->start_handle;
+        //         memcpy(&element->uuid, &service->uuid, sizeof(bt_uuid_t));
+        //         element->type = BT_GATT_DISCOVER_PRIMARY;
+        //         element->properties = 0;
+        //         element->permissions = 0;
+        //     }
+
+        //     zblue_gatt_client_discover_chrc(conn, service->uuid_ref, service->start_handle, service->end_handle);
+        //     return BT_GATT_ITER_STOP;
+        // } else {
+        //     BT_LOGD("%s, all services discovered", __func__);
+        //     uint8_t base = instance->current_element_base_idx;
+        //     uint8_t size = instance->element_size - base;
+
+        //     if_gattc_on_service_discovered(&instance->addr, &instance->element[base], size);
+        //     if_gattc_on_discover_completed(&addr, GATT_STATUS_SUCCESS);
+        //     instance->element_size = 0;
+        //     instance->service_idx = 0;
+        //     instance->service_size = 0;
+        //     instance->current_element_base_idx = 0;
+        // }
         return BT_GATT_ITER_STOP;
     }
 
-    BT_LOGD("%s, [ATTRIBUTE] handle 0x%04X", __func__, attr->handle);
+    BT_LOGD("%s, [DESCRIPTOR] handle 0x%04X", __func__, attr->handle);
 
-    data = attr->user_data;
     element = gatt_alloc_element_by_addr(&addr);
     if (!element) {
         BT_LOGE("%s, alloc element fail", __func__);
         return BT_GATT_ITER_STOP;
     }
 
-    element->handle = data->value_handle;
-    element->properties = data->properties;
+    element->type = params->type;
+    element->handle = attr->handle;
+    element->properties = 0;
+    element->permissions = attr->perm;
 
-    zblue_uuid1_to_uuid2(data->uuid, &element->uuid);
+    zblue_uuid1_to_uuid2(attr->uuid, &element->uuid);
+                        BT_LOGD("%s, element inserted: type=0x%02X, handle=0x%04X, idx = %u", __func__,
+                        element->type, element->handle, instance->element_size);
     return BT_GATT_ITER_CONTINUE;
-}
-
-static bt_status_t zblue_gatt_client_discover_chrc(struct bt_conn* conn, const struct bt_uuid* uuid,
-    uint16_t start_handle, uint16_t end_handle)
-{
-    static struct bt_gatt_discover_params discover_params = { 0 };
-
-    discover_params.uuid = uuid;
-    discover_params.start_handle = start_handle;
-    discover_params.end_handle = end_handle;
-    discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
-    discover_params.func = zblue_gatt_client_disc_chrc_callback;
-
-    if (bt_gatt_discover(conn, &discover_params) < 0) {
-        BT_LOGE("%s, gatt discovery fail", __func__);
-        return BT_STATUS_FAIL;
-    }
-
-    return BT_STATUS_SUCCESS;
 }
 
 static uint8_t zblue_gatt_client_disc_service_callback(struct bt_conn* conn, const struct bt_gatt_attr* attr,
@@ -406,12 +571,28 @@ static uint8_t zblue_gatt_client_disc_service_callback(struct bt_conn* conn, con
 
     if (!attr) {
         BT_LOGD("%s, start discovery service finished, start discovery char service_idx:%d", __func__, instance->service_idx);
-        service = &instance->service[instance->service_idx++];
-        zblue_gatt_client_discover_chrc(conn, service->uuid, service->start_handle, service->end_handle);
+        
+                BT_LOGD("%s, before increment: service_idx = %d", __func__, instance->service_idx);
+                service = &instance->service[instance->service_idx];
+                BT_LOGD("%s, after increment: service_idx = %d", __func__, instance->service_idx);
+
+        /* Saving current first service in elements table */
+        gatt_element_t* element = gatt_alloc_element_by_addr(&addr);
+        if (element) {
+            element->handle = service->start_handle;
+            memcpy(&element->uuid, &service->uuid, sizeof(bt_uuid_t));
+            element->type = BT_GATT_DISCOVER_PRIMARY;
+            element->properties = 0;
+            element->permissions = 0;
+                                BT_LOGD("%s, element inserted: type=0x%02X, handle=0x%04X, idx = %u", __func__,
+                        element->type, element->handle, instance->element_size);
+        }
+
+        zblue_gatt_client_discover_chrc(conn, service->uuid_ref, service->start_handle, service->end_handle);
         return BT_GATT_ITER_STOP;
     }
 
-    BT_LOGD("%s, [ATTRIBUTE] handle 0x%04X", __func__, attr->handle);
+    BT_LOGD("%s, [SERVICE] handle 0x%04X", __func__, attr->handle);
 
     service = gatt_alloc_service_by_addr(&addr);
     if (!service) {
@@ -422,9 +603,196 @@ static uint8_t zblue_gatt_client_disc_service_callback(struct bt_conn* conn, con
     data = attr->user_data;
     service->start_handle = attr->handle;
     service->end_handle = data->end_handle;
-    service->uuid = data->uuid;
+    service->uuid_ref = data->uuid;
+    zblue_uuid1_to_uuid2(data->uuid, &service->uuid);
 
     return BT_GATT_ITER_CONTINUE;
+}
+
+static uint8_t zblue_gatt_client_disc_chrc_callback(struct bt_conn* conn, const struct bt_gatt_attr* attr,
+    struct bt_gatt_discover_params* params)
+{
+    struct bt_gatt_chrc* data;
+    struct gatt_instance* instance;
+    struct gatt_service* service;
+    gatt_element_t* element;
+    bt_address_t addr;
+    uint16_t start_HDL, end_HDL;
+
+    get_le_addr_from_conn(conn, &addr);
+
+    instance = gatt_find_instance_by_addr(&addr);
+    if (!instance) {
+        BT_LOGE("%s, instance null", __func__);
+        return BT_GATT_ITER_STOP;
+    }
+
+    if (!attr) {
+        BT_LOGD("%s, finished discovering characteristics for service_idx:%d", __func__, instance->service_idx);
+        BT_LOGD("%s, before increment: service_idx = %d", __func__, instance->service_idx);
+        /* 找char */
+        service = &instance->service[instance->service_idx];
+        /* 先保留当前的service指针 */
+        BT_LOGD("%s, after increment: service_idx = %d", __func__, instance->service_idx);
+iter:
+        element = gatt_alloc_element_by_addr(&addr);
+        if (!element) {
+            BT_LOGE("%s, alloc element fail", __func__);
+            return BT_GATT_ITER_STOP;
+        }
+
+        element->type = BT_GATT_DISCOVER_CHARACTERISTIC;
+        element->handle = instance->element_char[instance->element_char_idx].value_handle;
+        element->properties = instance->element_char[instance->element_char_idx].properties;
+        memcpy(&element->uuid, &instance->element_char[instance->element_char_idx].uuid, sizeof(bt_uuid_t));
+                    BT_LOGD("%s, element inserted: type=0x%02X, handle=0x%04X, idx = %u", __func__,
+                        element->type, element->handle, instance->element_size);
+        start_HDL = instance->element_char[instance->element_char_idx++].value_handle + 1;
+
+        if (instance->element_char_idx < instance->element_char_size) {
+            end_HDL = instance->element_char[instance->element_char_idx].decl_handle - 1;
+        } else {
+            /* 这里标志的是所有char的descriptor描述符搜索完毕，是否可以记录一个完成标志？ */
+            end_HDL = service->end_handle;
+            instance->element_char_idx = 0;
+            instance->element_char_size = 0;
+            instance->service_idx++;
+            /* start和end 的handle值会参与本轮des寻找，callback中通过这个方法判断所有char已经找完 */
+            BT_LOGE("last");
+        }
+
+        if (start_HDL <= end_HDL) {
+            /* 有效descriptor描述符 */
+            zblue_gatt_client_discover_descriptor(conn, NULL, start_HDL, end_HDL);
+        } else if (instance->element_char_idx == 0 && instance->element_char_size == 0) {
+            BT_LOGE(" start_HDL > end_HDL");
+            /* 上面已经判断过一次所有char发现结束了，所以这里只需要通过条件切下一个char即可 */
+            /* 无效描述符，这里应该切下一个char去判断才对，而不是直接认为这个service发现结束！ */
+            /* 是否向上goto程序？ */
+            // goto iter;
+
+            /* 通过条件判断是否是最后一轮所有char已经找完了 */
+            if (instance->service_idx < instance->service_size) {
+                /* 这个char已经找完了，看下个service了 */
+                uint8_t base = instance->current_element_base_idx;
+                uint8_t size = instance->element_size - base;
+
+                if_gattc_on_service_discovered(&instance->addr, &instance->element[base], size);
+
+                instance->current_element_base_idx = instance->element_size;
+                BT_LOGD("%s, before increment: service_idx = %d", __func__, instance->service_idx);
+                service = &instance->service[instance->service_idx];
+                BT_LOGD("%s, after increment: service_idx = %d", __func__, instance->service_idx);
+                /* Save new service declaration */
+                element = gatt_alloc_element_by_addr(&addr);
+                if (element) {
+                    element->handle = service->start_handle;
+                    memcpy(&element->uuid, &service->uuid, sizeof(bt_uuid_t));
+                    element->type = BT_GATT_DISCOVER_PRIMARY;
+                    element->properties = 0;
+                    element->permissions = 0;
+                    BT_LOGD("%s, element inserted: type=0x%02X, handle=0x%04X, idx = %u", __func__,
+                        element->type, element->handle, instance->element_size);
+                    /* 在新的service查找char */
+                    zblue_gatt_client_discover_chrc(conn, service->uuid_ref, service->start_handle, service->end_handle);
+                }
+            } else {
+                /* 所有service找完，上报completed */
+                BT_LOGD("%s, all services discovered", __func__);
+                uint8_t base = instance->current_element_base_idx;
+                uint8_t size = instance->element_size - base;
+
+                if_gattc_on_service_discovered(&instance->addr, &instance->element[base], size);
+                if_gattc_on_discover_completed(&addr, GATT_STATUS_SUCCESS);
+                instance->element_size = 0;
+                instance->service_idx = 0;
+                instance->service_size = 0;
+                instance->current_element_base_idx = 0;
+                instance->element_char_idx = 0;
+                instance->element_char_size = 0;
+            }
+            return BT_GATT_ITER_STOP;
+        } else {
+            goto iter;
+        }
+
+        // instance->service_idx++;
+        // service = &instance->service[instance->service_idx];
+        // zblue_gatt_client_discover_chrc(conn, service->uuid_ref, service->start_handle, service->end_handle);
+        // zblue_gatt_client_discover_descriptor(conn, service->uuid_ref, service->start_handle, service->end_handle);
+        return BT_GATT_ITER_STOP;
+    }
+
+    BT_LOGD("%s, [CHAR] handle 0x%04X", __func__, attr->handle);
+
+    data = attr->user_data;
+    // element = gatt_alloc_element_by_addr(&addr);
+    // if (!element) {
+    //     BT_LOGE("%s, alloc element fail", __func__);
+    //     return BT_GATT_ITER_STOP;
+    // }
+
+    // element->type = params->type;
+    // element->handle = data->value_handle;
+    // element->properties = data->properties;
+
+    // zblue_uuid1_to_uuid2(data->uuid, &element->uuid);
+
+    if (instance->element_char_size >= CONFIG_GATT_CLIENT_CHAR_PER_SERVICE_MAX) {
+        BT_LOGE("%s, too many chars", __func__);
+        return BT_GATT_ITER_STOP;
+    }
+
+    gatt_element_char_t* ch = &instance->element_char[instance->element_char_size++];
+    ch->decl_handle = attr->handle;
+    ch->value_handle = data->value_handle;
+    ch->properties = data->properties;
+    zblue_uuid1_to_uuid2(data->uuid, &ch->uuid);
+
+    return BT_GATT_ITER_CONTINUE;
+}
+
+static bt_status_t zblue_gatt_client_discover_descriptor(struct bt_conn* conn, const struct bt_uuid* uuid,
+    uint16_t start_handle, uint16_t end_handle)
+{
+    static struct bt_gatt_discover_params desc_params = { 0 };
+
+    memset(&desc_params, 0, sizeof(desc_params));
+    desc_params.uuid = NULL;
+    desc_params.start_handle = start_handle;
+    desc_params.end_handle = end_handle;
+    desc_params.type = BT_GATT_DISCOVER_DESCRIPTOR;
+    desc_params.func = zblue_gatt_client_disc_desc_callback;
+
+    BT_LOGD("%s, element search: type=0x%02X, start handle=0x%04X, end handle=0x%04X", __func__,
+            desc_params.type, desc_params.start_handle, desc_params.end_handle);
+
+    if (bt_gatt_discover(conn, &desc_params) < 0) {
+        BT_LOGE("%s, descriptor discovery failed", __func__);
+        return BT_STATUS_FAIL;
+    }
+
+    return BT_STATUS_SUCCESS;
+}
+
+static bt_status_t zblue_gatt_client_discover_chrc(struct bt_conn* conn, const struct bt_uuid* uuid,
+    uint16_t start_handle, uint16_t end_handle)
+{
+    static struct bt_gatt_discover_params discover_params = { 0 };
+
+    discover_params.uuid = NULL;
+    discover_params.start_handle = start_handle;
+    discover_params.end_handle = end_handle;
+    discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+    discover_params.func = zblue_gatt_client_disc_chrc_callback;
+    BT_LOGD("%s, element search: type=0x%02X, start handle=0x%04X, end handle=0x%04X", __func__,
+            discover_params.type, discover_params.start_handle, discover_params.end_handle);
+    if (bt_gatt_discover(conn, &discover_params) < 0) {
+        BT_LOGE("%s, gatt discovery fail", __func__);
+        return BT_STATUS_FAIL;
+    }
+
+    return BT_STATUS_SUCCESS;
 }
 
 static uint8_t gatt_client_read_element_callback(struct bt_conn* conn, uint8_t err,
@@ -459,6 +827,7 @@ static void gatt_client_write_cmd_callback(struct bt_conn* conn, uint8_t err,
     if (err) {
         BT_LOGE("%s, gatt write fail err:%d", __func__, err);
         if_gattc_on_element_written(&addr, params->handle, BT_STATUS_FAIL);
+        free(params);
         return;
     }
 
@@ -466,6 +835,8 @@ static void gatt_client_write_cmd_callback(struct bt_conn* conn, uint8_t err,
     memcpy(&addr, info.le.dst->a.val, sizeof(addr));
 
     if_gattc_on_element_written(&addr, params->handle, BT_STATUS_SUCCESS);
+
+    free(params);
 }
 
 static void gatt_client_write_callback(struct bt_conn* conn, void* user_data)
@@ -492,9 +863,9 @@ static uint8_t bt_gatt_notify_handler(struct bt_conn* conn, struct bt_gatt_subsc
     bt_conn_get_info(conn, &info);
     memcpy(&addr, info.le.dst->a.val, sizeof(addr));
 
-    handle = params->ccc_handle;
+    handle = params->ccc_handle - 1; // convert ccc_handle to value_handle
     if (data == NULL) {
-        BT_LOGE("[UNSUBSCRIBED] 0x%04X", params->ccc_handle);
+        BT_LOGE("[UNSUBSCRIBED] 0x%04X", params->ccc_handle - 1);
         return BT_GATT_ITER_STOP;
     }
 
@@ -515,10 +886,23 @@ static void bt_gatt_subscribe_response(struct bt_conn* conn, uint8_t err,
     if_gattc_on_element_subscribed(&addr, params->value_handle, err ? BT_STATUS_FAIL : BT_STATUS_SUCCESS, true);
 }
 
+static void bt_gatt_unsubscribe_response(struct bt_conn* conn, uint8_t err,
+    struct bt_gatt_subscribe_params* params)
+{
+    struct bt_conn_info info;
+    bt_address_t addr;
+
+    BT_LOGD("%s, err:%d", __func__, err);
+    bt_conn_get_info(conn, &info);
+    memcpy(&addr, info.le.dst->a.val, sizeof(addr));
+
+    if_gattc_on_element_subscribed(&addr, params->value_handle, err ? BT_STATUS_FAIL : BT_STATUS_SUCCESS, false);
+}
+
 bt_status_t bt_sal_gatt_client_discover_all_services(bt_controller_id_t id, bt_address_t* addr)
 {
     static struct bt_gatt_discover_params disc_params = { 0 };
-    struct bt_conn* conn;
+    struct bt_conn* conn = NULL;
     int err;
 
     conn = get_le_conn_from_addr(addr);
@@ -545,7 +929,7 @@ bt_status_t bt_sal_gatt_client_discover_all_services(bt_controller_id_t id, bt_a
 bt_status_t bt_sal_gatt_client_discover_service_by_uuid(bt_controller_id_t id, bt_address_t* addr, bt_uuid_t* uuid)
 {
     static struct bt_gatt_discover_params disc_params = { 0 };
-    struct bt_conn* conn;
+    struct bt_conn* conn = NULL;
     int err;
     static union uuid u;
 
@@ -565,6 +949,8 @@ bt_status_t bt_sal_gatt_client_discover_service_by_uuid(bt_controller_id_t id, b
     disc_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
     disc_params.type = BT_GATT_DISCOVER_PRIMARY;
     disc_params.func = zblue_gatt_client_disc_service_callback;
+    BT_LOGD("%s, element search: type=0x%02X, start handle=0x%04X, end handle=0x%04X", __func__,
+            disc_params.type, disc_params.start_handle, disc_params.end_handle);
     err = bt_gatt_discover(conn, &disc_params);
     if (err < 0) {
         BT_LOGE("%s, gatt discovery fail", __func__);
@@ -577,7 +963,7 @@ bt_status_t bt_sal_gatt_client_discover_service_by_uuid(bt_controller_id_t id, b
 bt_status_t bt_sal_gatt_client_read_element(bt_controller_id_t id, bt_address_t* addr, uint16_t element_id)
 {
     static struct bt_gatt_read_params read_params = { 0 };
-    struct bt_conn* conn;
+    struct bt_conn* conn = NULL;
     int err;
 
     conn = get_le_conn_from_addr(addr);
@@ -602,7 +988,7 @@ bt_status_t bt_sal_gatt_client_read_element(bt_controller_id_t id, bt_address_t*
 
 bt_status_t bt_sal_gatt_client_write_element(bt_controller_id_t id, bt_address_t* addr, uint16_t element_id, uint8_t* value, uint16_t length, gatt_write_type_t write_type)
 {
-    struct bt_conn* conn;
+    struct bt_conn* conn = NULL;
     int err;
 
     conn = get_le_conn_from_addr(addr);
@@ -612,17 +998,21 @@ bt_status_t bt_sal_gatt_client_write_element(bt_controller_id_t id, bt_address_t
     }
 
     if (write_type == GATT_WRITE_TYPE_RSP) {
-        struct bt_gatt_write_params write_params = { 0 };
+        struct bt_gatt_write_params* write_params = zalloc(sizeof(struct bt_gatt_write_params));
+        if (!write_params) {
+            return BT_STATUS_NOMEM;
+        }
 
-        write_params.func = gatt_client_write_cmd_callback;
-        write_params.handle = element_id;
-        write_params.data = value;
-        write_params.length = length;
-        write_params.offset = 0;
+        write_params->func = gatt_client_write_cmd_callback;
+        write_params->handle = element_id;
+        write_params->data = value;
+        write_params->length = length;
+        write_params->offset = 0;
 
-        err = bt_gatt_write(conn, &write_params);
+        err = bt_gatt_write(conn, write_params);
         if (err) {
             BT_LOGE("%s, gatt write fail err:%d", __func__, err);
+            free(write_params);
             return BT_STATUS_FAIL;
         }
     } else if (write_type == GATT_WRITE_TYPE_NO_RSP) {
@@ -643,10 +1033,17 @@ bt_status_t bt_sal_gatt_client_write_element(bt_controller_id_t id, bt_address_t
 
 bt_status_t bt_sal_gatt_client_register_notifications(bt_controller_id_t id, bt_address_t* addr, uint16_t element_id, uint16_t properties, bool enable)
 {
-    static struct bt_gatt_subscribe_params subscribe_params = { 0 };
+    static struct bt_gatt_subscribe_params notify_params = { 0 };
+    static struct bt_gatt_subscribe_params indicate_params = { 0 }; /* FIXME: Only supports one connected subscription */
+
     uint16_t value;
-    struct bt_conn* conn;
+    struct bt_conn* conn = NULL;
     int err;
+
+    if (!(properties & (GATT_PROP_NOTIFY | GATT_PROP_INDICATE))) {
+        BT_LOGE("%s, invalid properties:0x%04x", __func__, properties);
+        return BT_STATUS_PARM_INVALID;
+    }
 
     BT_LOGD("%s, addr:%s, element_id:0x%0x, properties:0x%0x, enable:%d", __func__, bt_addr_str(addr), element_id, properties, enable);
     conn = get_le_conn_from_addr(addr);
@@ -655,37 +1052,63 @@ bt_status_t bt_sal_gatt_client_register_notifications(bt_controller_id_t id, bt_
         return BT_STATUS_FAIL;
     }
 
-    if (properties == GATT_PROP_NOTIFY) {
-        value = BT_GATT_CCC_NOTIFY;
-    } else if (properties == GATT_PROP_INDICATE) {
-        value = BT_GATT_CCC_INDICATE;
-    } else {
-        BT_LOGE("%s, properties:%d invalid", __func__, properties);
-        return BT_STATUS_PARM_INVALID;
-    }
+    if (properties & GATT_PROP_NOTIFY) {
+        notify_params.value_handle = element_id;
+        notify_params.ccc_handle = element_id + 1;
+        notify_params.notify = bt_gatt_notify_handler;
+        notify_params.value = BT_GATT_CCC_NOTIFY;
 
-    subscribe_params.value_handle = element_id - 1;
-    subscribe_params.ccc_handle = element_id;
-    subscribe_params.notify = bt_gatt_notify_handler;
-    subscribe_params.subscribe = bt_gatt_subscribe_response;
-    subscribe_params.value = value;
+        if (enable) {
+            notify_params.subscribe = bt_gatt_subscribe_response;
+            err = bt_gatt_subscribe(conn, &notify_params);
+        } else {
+            notify_params.subscribe = bt_gatt_unsubscribe_response;
+            err = bt_gatt_unsubscribe(conn, &notify_params);
+        }
 
-    if (enable) {
-        err = bt_gatt_subscribe(conn, &subscribe_params);
         if (err) {
-            BT_LOGE("%s, gatt subscribe fail err:%d", __func__, err);
+            BT_LOGE("%s, %s NOTIFY failed, err:%d", __func__,
+                    enable ? "subscribe" : "unsubscribe", err);
             return BT_STATUS_FAIL;
         }
-    } else {
-        err = bt_gatt_unsubscribe(conn, &subscribe_params);
+    }
+
+    if (properties & GATT_PROP_INDICATE) {
+        indicate_params.value_handle = element_id;
+        indicate_params.ccc_handle = element_id + 1;
+        indicate_params.notify = bt_gatt_notify_handler;
+        indicate_params.value = BT_GATT_CCC_INDICATE;
+
+        if (enable) {
+            indicate_params.subscribe = bt_gatt_subscribe_response;
+            err = bt_gatt_subscribe(conn, &indicate_params);
+        } else {
+            indicate_params.subscribe = bt_gatt_unsubscribe_response;
+            err = bt_gatt_unsubscribe(conn, &indicate_params);
+        }
+
         if (err) {
-            BT_LOGE("%s, gatt subscribe fail err:%d", __func__, err);
+            BT_LOGE("%s, %s INDICATE failed, err:%d", __func__,
+                    enable ? "subscribe" : "unsubscribe", err);
             return BT_STATUS_FAIL;
         }
     }
 
     return BT_STATUS_SUCCESS;
 }
+
+static void zblue_gattc_mtu_updated_callback(struct bt_conn* conn, uint16_t tx, uint16_t rx)
+{
+    bt_address_t addr;
+
+    BT_LOGD("Updated MTU: TX: %d RX: %d bytes, MIN: %d", tx, rx, MIN(tx, rx));
+    zblue_conn_get_addr(conn, &addr);
+    if_gattc_on_mtu_changed(&addr, MIN(tx, rx) - 3, BT_STATUS_SUCCESS);
+}
+
+static struct bt_gatt_cb zblue_gatt_callbacks = {
+    .att_mtu_updated = zblue_gattc_mtu_updated_callback
+};
 
 static void gatt_exchange_mtu_func(struct bt_conn* conn, uint8_t err,
     struct bt_gatt_exchange_params* params)
@@ -727,7 +1150,7 @@ bt_status_t bt_sal_gatt_client_send_mtu_req(bt_controller_id_t id, bt_address_t*
 static void STACK_CALL(update_connection_parameter)(void* args)
 {
     sal_adapter_req_t* req = args;
-    struct bt_conn* conn;
+    struct bt_conn* conn = NULL;
     int err;
 
     conn = get_le_conn_from_addr(&req->addr);
@@ -741,6 +1164,20 @@ static void STACK_CALL(update_connection_parameter)(void* args)
         BT_LOGE("%s, update param failed err:%d", __func__, err);
         return;
     }
+}
+
+bt_status_t bt_sal_gatt_client_enable(void)
+{
+    bt_gatt_cb_register(&zblue_gatt_callbacks);
+
+    return BT_STATUS_SUCCESS;
+}
+
+bt_status_t bt_sal_gatt_client_disable(void)
+{
+    bt_gatt_cb_unregister(&zblue_gatt_callbacks);
+
+    return BT_STATUS_SUCCESS;
 }
 
 bt_status_t bt_sal_gatt_client_update_connection_parameter(bt_controller_id_t id, bt_address_t* addr, uint32_t min_interval, uint32_t max_interval, uint32_t latency,
@@ -768,7 +1205,7 @@ bt_status_t bt_sal_gatt_client_update_connection_parameter(bt_controller_id_t id
 
 bt_status_t bt_sal_gatt_client_read_remote_rssi(bt_controller_id_t id, bt_address_t* addr)
 {
-    struct bt_conn* conn;
+    struct bt_conn* conn = NULL;
     int err;
     int8_t rssi;
 
@@ -791,7 +1228,7 @@ bt_status_t bt_sal_gatt_client_read_remote_rssi(bt_controller_id_t id, bt_addres
 bt_status_t bt_sal_gatt_client_read_phy(bt_controller_id_t id, bt_address_t* addr)
 {
 #ifdef CONFIG_BT_USER_PHY_UPDATE
-    struct bt_conn* conn;
+    struct bt_conn* conn = NULL;
     struct bt_conn_info info;
     int err;
     ble_phy_type_t tx_mode;

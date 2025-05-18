@@ -217,7 +217,9 @@ static void gattc_service_delete(gattc_service_t* service)
         return;
 
     if (service->elements)
+#ifndef CONFIG_BLUETOOTH_STACK_LE_ZBLUE
         free(service->elements);
+#endif
     free(service);
 }
 
@@ -374,6 +376,10 @@ static bt_status_t if_gattc_startup(profile_on_startup_t cb)
         goto fail;
     }
 
+    status = bt_sal_gatt_client_enable();
+    if (status != BT_STATUS_SUCCESS)
+        goto fail;
+
     manager->started = true;
     pthread_mutex_unlock(&manager->device_lock);
     cb(PROFILE_GATTC, true);
@@ -406,6 +412,7 @@ static bt_status_t if_gattc_shutdown(profile_on_shutdown_t cb)
     manager->connections = NULL;
     index_allocator_delete(&manager->allocator);
     manager->started = false;
+    bt_sal_gatt_server_disable();
     cb(PROFILE_GATTC, true);
     pthread_mutex_unlock(&manager->device_lock);
     cb(PROFILE_GATTC, true);

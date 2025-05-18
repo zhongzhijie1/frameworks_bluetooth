@@ -221,6 +221,10 @@ static void zblue_on_connect_req(struct bt_conn* conn, uint8_t link_type, uint8_
 
 static void zblue_on_connected(struct bt_conn* conn, uint8_t err)
 {
+    if (!bt_conn_get_dst_br(conn)) {
+        return;
+    }
+
     acl_state_param_t state = {
         .transport = BT_TRANSPORT_BREDR,
         .connection_state = CONNECTION_STATE_CONNECTED
@@ -233,10 +237,14 @@ static void zblue_on_connected(struct bt_conn* conn, uint8_t err)
 
 static void zblue_on_disconnected(struct bt_conn* conn, uint8_t reason)
 {
+    if (!bt_conn_get_dst_br(conn)) {
+        return;
+    }
+
     acl_state_param_t state = {
         .transport = BT_TRANSPORT_BREDR,
         .connection_state = CONNECTION_STATE_DISCONNECTED,
-        .hci_reason_code = reason,
+        .hci_reason_code = reason
     };
 
     zblue_conn_get_addr(conn, &state.addr);
