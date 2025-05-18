@@ -58,8 +58,6 @@ typedef struct {
     uint16_t* cnt;
 } device_context_t;
 
-extern int zblue_main(void);
-
 static void zblue_on_connected(struct bt_conn* conn, uint8_t err);
 static void zblue_on_disconnected(struct bt_conn* conn, uint8_t reason);
 static void zblue_on_security_changed(struct bt_conn* conn, bt_security_t level, enum bt_security_err err);
@@ -103,13 +101,27 @@ static void zblue_on_connected(struct bt_conn* conn, uint8_t err)
     int i;
     acl_state_param_t state = {
         .transport = BT_TRANSPORT_BLE,
-        .connection_state = CONNECTION_STATE_CONNECTED
+        .status = err,
     };
 
     BT_LOGD("%s, err:%d", __func__, err);
     bt_conn_get_info(conn, &info);
 
     if (info.type != BT_CONN_TYPE_LE) {
+        return;
+    }
+
+    memcpy(&state.addr, info.le.dst->a.val, sizeof(state.addr));
+
+    if (err) {
+        bt_conn_unref(conn);
+        state.connection_state = CONNECTION_STATE_DISCONNECTED;
+        adapter_on_connection_state_changed(&state);
+        if (info.role == BT_HCI_ROLE_PERIPHERAL) {
+            if_gatts_on_connection_state_changed(&state.addr, PROFILE_STATE_DISCONNECTED);
+        } else if (info.role == BT_HCI_ROLE_CENTRAL) {
+            if_gattc_on_connection_state_changed(&state.addr, PROFILE_STATE_DISCONNECTED);
+        }
         return;
     }
 
@@ -120,7 +132,7 @@ static void zblue_on_connected(struct bt_conn* conn, uint8_t err)
         }
     }
 
-    memcpy(&state.addr, info.le.dst->a.val, sizeof(state.addr));
+    state.connection_state = CONNECTION_STATE_CONNECTED;
     adapter_on_connection_state_changed(&state);
     if (info.role == BT_HCI_ROLE_PERIPHERAL) {
         if_gatts_on_connection_state_changed(&state.addr, PROFILE_STATE_CONNECTED);
@@ -135,7 +147,8 @@ static void zblue_on_disconnected(struct bt_conn* conn, uint8_t reason)
     int i;
     acl_state_param_t state = {
         .transport = BT_TRANSPORT_BLE,
-        .connection_state = CONNECTION_STATE_DISCONNECTED
+        .connection_state = CONNECTION_STATE_DISCONNECTED,
+        .hci_reason_code = reason
     };
 
     BT_LOGD("%s", __func__);
@@ -151,6 +164,8 @@ static void zblue_on_disconnected(struct bt_conn* conn, uint8_t reason)
             break;
         }
     }
+
+    bt_conn_unref(conn);
 
     memcpy(&state.addr, info.le.dst->a.val, sizeof(state.addr));
     adapter_on_connection_state_changed(&state);
@@ -394,7 +409,6 @@ struct bt_conn* get_le_conn_from_addr(bt_address_t* addr)
 }
 
 bt_status_t get_le_addr_from_conn(struct bt_conn* conn, bt_address_t* addr)
-
 {
     struct bt_conn_info info;
 
@@ -409,7 +423,10 @@ bt_status_t get_le_addr_from_conn(struct bt_conn* conn, bt_address_t* addr)
 
 bt_status_t bt_sal_le_init(const bt_vhal_interface* vhal)
 {
-    zblue_main();
+#ifndef CONFIG_BLUETOOTH_BREDR_SUPPORT
+    extern void z_sys_init(void);
+    z_sys_init();
+#endif
 
     bt_conn_cb_register(&g_conn_cbs);
     bt_conn_auth_info_cb_register(&g_conn_auth_info_cbs);
